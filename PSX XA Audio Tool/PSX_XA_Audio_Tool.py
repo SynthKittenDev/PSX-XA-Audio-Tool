@@ -603,22 +603,43 @@ def stop_play():
     if _play_thr: _play_thr.join(timeout=3)
     _stop_evt.clear()
 
-def play_pcm(pcm: list, ch: int, rate: int, done_cb=None):
+def play_pcm(pcm: list, ch: int, rate: int, done_cb=None, get_volume=None):
     global _play_thr
     stop_play()
     def work():
         try:
             if _BACKEND == 'sounddevice' and np and sd:
-                arr = np.array(pcm, dtype=np.int16)
-                if ch == 2: arr = arr.reshape(-1, 2)
-                sd.play(arr, rate)
-                while sd.get_stream().active:
-                    if _stop_evt.is_set(): break
-                    time.sleep(0.05)
-                sd.stop()
+                arr = np.array(pcm, dtype=np.float32) / 32768.0
+                arr = arr.reshape(-1, ch)
+                pos = [0]
+                def callback(outdata, frames, time_info, status):
+                    vol = get_volume() if get_volume else 1.0
+                    start = pos[0]
+                    if start >= len(arr) or _stop_evt.is_set():
+                        outdata[:] = 0
+                        raise sd.CallbackStop()
+                    end = start + frames
+                    chunk = arr[start:end]
+                    n = len(chunk)
+                    outdata[:n] = chunk * vol
+                    if n < frames:
+                        outdata[n:] = 0
+                        pos[0] = start + n
+                        raise sd.CallbackStop()
+                    pos[0] = end
+                with sd.OutputStream(samplerate=rate, channels=ch,
+                                     dtype='float32', callback=callback) as stream:
+                    while stream.active:
+                        if _stop_evt.is_set(): break
+                        time.sleep(0.05)
             else:
+                vol = get_volume() if get_volume else 1.0
+                if abs(vol - 1.0) > 1e-6:
+                    play_data = [max(-32768, min(32767, int(s * vol))) for s in pcm]
+                else:
+                    play_data = pcm
                 tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                tmp.write(pcm_to_wav_bytes(pcm, ch, rate))
+                tmp.write(pcm_to_wav_bytes(play_data, ch, rate))
                 tmp.close()
                 if sys.platform == 'win32':
                     import winsound
@@ -649,7 +670,7 @@ def play_pcm(pcm: list, ch: int, rate: int, done_cb=None):
 class XATool(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PSX XA Audio Tool  v1.0a")
+        self.title("PSX XA Audio Tool  v1.0")
         self.minsize(940, 700)
         try: ttk.Style(self).theme_use('clam')
         except: pass
@@ -667,8 +688,12 @@ class XATool(tk.Tk):
         self.wav_rate = 44100
         self.v_ch   = tk.IntVar(value=2)
         self.v_rate = tk.IntVar(value=37800)
+        self._vol   = [1.0]
         self.bulk_queue        = []
         self._bulk_iid_counter = 0
+        self._play_gen         = 0
+        self._tree_sort        = {'col': None, 'reverse': False}
+        self._bulk_sort        = {'col': None, 'reverse': False}
         self._build_ui()
 
     def _build_ui(self):
@@ -692,7 +717,9 @@ class XATool(tk.Tk):
         self.tree = ttk.Treeview(ft, columns=cols, show='headings',
                                  height=5, selectmode='browse')
         for c, w in zip(cols, widths):
-            self.tree.heading(c, text=c)
+            self.tree.heading(c, text=c,
+                              command=lambda _c=c: self._sort_tree(
+                                  self.tree, _c, self._tree_sort))
             self.tree.column(c, width=w, anchor='center', stretch=(c == 'Notes'))
         vsb = ttk.Scrollbar(ft, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -726,6 +753,12 @@ class XATool(tk.Tk):
         self.b_exp  = ttk.Button(rp, text="💾  Export WAV…",
                                  command=self.export_wav, state='disabled')
         for b in (self.b_play, self.b_stop, self.b_exp): b.pack(side='left', padx=4)
+        ttk.Label(rp, text="Volume:").pack(side='left', padx=(12, 2))
+        self.vol_slider = ttk.Scale(rp, from_=0.0, to=1.0, orient='horizontal',
+                                    length=120,
+                                    command=lambda v: self._vol.__setitem__(0, float(v)))
+        self.vol_slider.set(1.0)
+        self.vol_slider.pack(side='left', padx=(0, 4))
         self.pbar = ttk.Progressbar(fp, mode='indeterminate')
         self.pbar.pack(fill='x', padx=8, pady=(2, 6))
 
@@ -738,7 +771,7 @@ class XATool(tk.Tk):
         self.l_wav.pack(side='left', fill='x', expand=True, padx=6)
         self.l_wav_info = ttk.Label(
             fr,
-            text="Accepts any sample rate incl. 44100 Hz — "
+            text="Accepts any sample rate — "
                  "auto-resampled to the XA track's native rate on replace.",
             foreground='#555', anchor='w')
         self.l_wav_info.pack(fill='x', padx=8)
@@ -764,7 +797,9 @@ class XATool(tk.Tk):
         self.bulk_tree = ttk.Treeview(fb, columns=bcols, show='headings',
                                       height=4, selectmode='extended')
         for c, w in zip(bcols, bwidths):
-            self.bulk_tree.heading(c, text=c)
+            self.bulk_tree.heading(c, text=c,
+                                   command=lambda _c=c: self._sort_tree(
+                                       self.bulk_tree, _c, self._bulk_sort))
             self.bulk_tree.column(c, width=w, anchor='center',
                                   stretch=(c == 'WAV File'))
         bvsb = ttk.Scrollbar(fb, orient='vertical', command=self.bulk_tree.yview)
@@ -805,10 +840,45 @@ class XATool(tk.Tk):
 
         numpy_status = 'yes' if np is not None else 'NO — install numpy for fast resampling'
         enc_mode = ('numba' if _HAS_NUMBA else 'numpy') if np is not None else 'python'
-        self._log(f"PSX XA Audio Tool v1.0a  |  backend: {_BACKEND}  |"
+        self._log(f"PSX XA Audio Tool v1.0  |  backend: {_BACKEND}  |"
                   f"  numpy: {numpy_status}  |  encoder: {enc_mode}")
         self._log("Open a .bin or .xa file.  "
                   "Each (file, channel) XA stream appears as a separate track row.")
+
+    def _sort_tree(self, tree, col, sort_state):
+        reverse = not sort_state.get('reverse', False) if sort_state.get('col') == col else False
+        sort_state['col'] = col
+        sort_state['reverse'] = reverse
+
+        def key(iid):
+            v = tree.set(iid, col)
+            if col in ('#', 'Track', 'Sectors'):
+                try: return int(v)
+                except: return 0
+            if col in ('File', 'Channel', 'Ch'):
+                try: return int(v, 16)
+                except: return 0
+            if col == 'Rate':
+                try: return int(v.replace(' Hz', '').strip())
+                except: return 0
+            if col == 'Duration':
+                try: return float(v.rstrip('s').strip())
+                except: return 0.0
+            return v.lower()
+
+        data = [(key(iid), iid) for iid in tree.get_children('')]
+        data.sort(reverse=reverse)
+        for i, (_, iid) in enumerate(data):
+            tree.move(iid, '', i)
+
+        for c in tree['columns']:
+            txt = tree.heading(c, 'text')
+            for sfx in (' ▲', ' ▼'):
+                if txt.endswith(sfx):
+                    txt = txt[:-len(sfx)]
+                    break
+            arrow = (' ▲' if not reverse else ' ▼') if c == col else ''
+            tree.heading(c, text=txt + arrow)
 
     def _log(self, msg: str):
         self.log.configure(state='normal')
@@ -880,6 +950,14 @@ class XATool(tk.Tk):
     def _fill_tree(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
+        self._tree_sort = {'col': None, 'reverse': False}
+        for c in self.tree['columns']:
+            txt = self.tree.heading(c, 'text')
+            for sfx in (' ▲', ' ▼'):
+                if txt.endswith(sfx):
+                    txt = txt[:-len(sfx)]
+                    break
+            self.tree.heading(c, text=txt)
         for t in self.tracks:
             spg = 4 * SPU if t['stereo'] else 8 * SPU
             dur = t['n_sectors'] * N_GROUPS * spg / t['rate']
@@ -963,25 +1041,46 @@ class XATool(tk.Tk):
         dur = len(self.decoded_pcm) / self.decoded_ch / self.decoded_rate
         self._log(f"▶ Track {t['index']+1}  "
                   f"[0x{t['file_num']:02X} / 0x{t['channel_num']:02X}]  {dur:.1f}s…")
+        self._play_gen += 1
+        gen = self._play_gen
         self.b_play.configure(state='disabled')
         self.b_stop.configure(state='normal')
         play_pcm(self.decoded_pcm, self.decoded_ch, self.decoded_rate,
-                 done_cb=lambda: self.after(0, self._play_done))
+                 done_cb=lambda: self.after(0, lambda: self._play_done(gen)),
+                 get_volume=lambda: self._vol[0])
 
     def prev_wav(self):
         if not self.wav_pcm: return
         self._log("▶ WAV preview…")
+        self._play_gen += 1
+        gen = self._play_gen
+        self.b_prv.configure(state='disabled')
+        self.b_stop.configure(state='normal')
         play_pcm(self.wav_pcm, self.wav_ch, self.wav_rate,
-                 done_cb=lambda: self.after(0, lambda: self._log("  Preview done.")))
+                 done_cb=lambda: self.after(0, lambda: self._wav_preview_done(gen)),
+                 get_volume=lambda: self._vol[0])
 
     def do_stop(self):
+        self._play_gen += 1
+        gen = self._play_gen
         stop_play()
-        self.after(150, self._play_done)
+        self.after(150, lambda: self._play_done(gen))
 
-    def _play_done(self):
+    def _play_done(self, gen=None):
+        if gen is not None and gen != self._play_gen:
+            return
         self.b_stop.configure(state='disabled')
+        self.b_prv.configure(state='normal' if self.wav_pcm else 'disabled')
         self._upd_btns()
         self._log("  Stopped.")
+
+    def _wav_preview_done(self, gen=None):
+        if gen is not None and gen != self._play_gen:
+            return
+        self.b_stop.configure(state='disabled')
+        self.b_prv.configure(state='normal' if self.wav_pcm else 'disabled')
+        self._upd_btns()
+        self._log("  Preview done.")
 
     def export_wav(self):
         if not self.decoded_pcm: return
